@@ -10,5 +10,6 @@ Copied from here:
 https://10fastfingers.com/text/816-100-most-common-English-words
 
 # TODO
+* win/lose condition
 * increasing difficuly
 * bells and whistles
