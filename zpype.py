@@ -1,8 +1,3 @@
-# the plan:
-# 1) one file.
-# 2) only subclass pygame if necessary or very helpful.
-# 3) write this as quickly as possible (just use globals for instance).
-
 import argparse
 import inspect
 import math
