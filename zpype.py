@@ -7,13 +7,23 @@ from pathlib import Path
 
 import pygame as pg
 
-dt = None
-font = None
-game = None
-group = None
-playersprite = None
-screen = None
-spawnrect = None
+SCREENSIZE = (500, 1000)
+FRAMERATE = 60
+FONTSIZE = 32
+PAD = 10
+
+SWITCH = pg.USEREVENT
+
+BIG_SHIP = (64, 32)
+SMALL_SHIP = (32, 32)
+
+SHIP_CHOICES = list()
+SHIP_CHOICES.extend((SMALL_SHIP, ) * 10)
+SHIP_CHOICES.extend((BIG_SHIP, ) * 1)
+
+global current_state, dt, font, game, playersprite, screen, spawnrect
+current_state = dt = font = game = playersprite = screen = spawnrect = None
+
 
 def lerp(a, b, t):
     return (1 - t) * a + t * b
@@ -282,129 +292,147 @@ class EnemyGroup(Enemy, Group):
         self.add(self.ship)
 
 
-class Game:
+class Engine:
 
-    def __init__(self, words, maxspawn, minletters=3, maxletters=6):
-        self.dictionary = defaultdict(list)
-        for word in words:
-            self.dictionary[len(word)].append(word)
-        self.maxspawn = maxspawn
-        self.minletters = minletters
-        self.maxletters = maxletters
+    def __init__(self, state, stepper=False):
+        self.npass, self.nfail = pg.init()
 
-        self.active_words = []
-        self.typing_at = None
+        global font, game, playersprite, screen, spawnrect
+        screen = Screen(SCREENSIZE)
+        font = pg.font.Font(None, FONTSIZE)
+        spawnrect = screen.rect.copy(height=screen.rect.height * .3,
+                                     midbottom=screen.rect.midtop)
 
-    def find(self, letter):
-        """
-        Return the already locked word, or the first word starting with `letter`.
-        """
-        for word in self.active_words:
-            if word.startswith(letter):
-                return word
+        playersprite = PlayerSprite()
+        playersprite.rect.midbottom = screen.rect.move(0, -16).midbottom
 
-    def hit_word(self, word):
-        """
-        Strip first letter from word, updating active_words, returning the new word.
-        """
-        index = self.active_words.index(word)
-        self.active_words[index] = self.active_words[index][1:]
-        if self.active_words[index] == '':
-            self.active_words.pop(index)
-            return None
-        return self.active_words[index]
+        self.stepper = stepper
+        self.do_step = not self.stepper
 
-    def spawn(self, nletters):
-        """
-        Return a random word of length nletters from dictionary.
-        """
-        return random.choice(self.dictionary[nletters])
+        self.clock = Clock(FRAMERATE)
 
-    def spawnmax(self):
-        while len(self.active_words) < self.maxspawn:
-            nletters = random.randint(self.minletters, self.maxletters)
-            word = self.spawn(nletters)
-            if (word not in self.active_words
-                    and not any(existing.startswith(word[0])
-                                for existing in self.active_words)):
-                self.active_words.append(word)
+        self.buffered_events = deque()
+        self.running = False
 
+        self.state_instances = {}
+        pg.event.post(pg.event.Event(SWITCH, state=state))
 
-def run(stepper=False):
-    global dt
-    global font
-    global game
-    global group
-    global playersprite
-    global screen
-    global spawnrect
+    def run(self):
+        self.running = True
+        while self.running:
+            self.step()
 
-    with open("words.txt") as words_file:
-        words = [line.strip() for line in words_file if len(line.strip()) > 2]
+    def get_event_handler(self, obj, event):
+        name = "on_" + pg.event.event_name(event.type).lower()
+        return getattr(obj, name, None)
 
-    game = Game(words, 2)
+    def on_quit(self, event):
+        self.running = False
 
-    npass, nfail = pg.init()
-    screen = Screen((500, 1000))
-    spawnrect = screen.rect.copy(height=screen.rect.height * .25, midtop=screen.rect.midtop)
+    def on_userevent(self, event):
+        global current_state
+        if hasattr(event, 'state'):
+            self.on_switch(event)
 
-    clock = Clock(60)
-    font = pg.font.Font(None, 32)
+    def on_switch(self, event):
+        global current_state
+        if current_state is not None:
+            current_state.on_exit()
+            current_state.clear(screen.image, screen.background)
+            dirty = current_state.draw(screen.image)
+            pg.display.update(dirty)
 
-    group = GameGroup()
+        state = event.state
+        if callable(event.state):
+            state = event.state()
 
-    playersprite = PlayerSprite()
-    playersprite.rect.midbottom = screen.rect.move(0, -16).midbottom
-    group.add(playersprite)
+        class_  = type(state)
+        if class_ in self.state_instances:
+            current_state = self.state_instances[class_]
+        else:
+            current_state = state
+            self.state_instances[class_] = state
 
-    step = not stepper
+        current_state.on_enter()
 
-    running = True
-    while running:
-        dt = clock.tick()
+    def on_keydown(self, event):
+        if (event.type == pg.KEYDOWN
+                and event.key == pg.K_TAB
+                and (event.mod & pg.KMOD_SHIFT)):
+            self.stepper = not self.stepper
+            if not self.stepper:
+                self.do_step = True
+        elif (event.type == pg.KEYDOWN
+                and event.key == pg.K_TAB
+                and not (event.mod & pg.KMOD_SHIFT)):
+            self.do_step = True
 
-        group.clear(screen.image, screen.background)
+    def handle_event(self, event):
+        for obj in [self, current_state]:
+            method = self.get_event_handler(obj, event)
+            if method is not None:
+                method(event)
+
+    def step(self):
+        global dt
+        dt = self.clock.tick()
+
+        events = pg.event.get()
+        if self.do_step:
+            while self.buffered_events:
+                events.insert(0, self.buffered_events.popleft())
+        else:
+            self.buffered_events.extend(events)
+
+        for event in events:
+            self.handle_event(event)
+
+        if self.do_step and current_state is not None:
+            current_state.update()
+            current_state.clear(screen.image, screen.background)
+            dirty = current_state.draw(screen.image)
+            pg.display.update(dirty)
+
+        if self.stepper:
+            self.do_step = False
+
+    def no_stepper_step(self):
+        global dt
+        dt = self.clock.tick()
 
         for event in pg.event.get():
-            if event.type == pg.QUIT:
-                running = False
-            elif (event.type == pg.KEYDOWN
-                    and event.key == pg.K_TAB
-                    and (event.mod & pg.KMOD_SHIFT)):
-                stepper = not stepper
-                if not stepper:
-                    step = True
-            elif (event.type == pg.KEYDOWN
-                    and event.key == pg.K_TAB
-                    and not (event.mod & pg.KMOD_SHIFT)):
-                step = True
-            else:
-                method = getattr(group, "on_" + pg.event.event_name(event.type).lower(), None)
-                if method is not None:
-                    method(event)
+            self.handle_event(event)
 
-        if step:
-            group.update()
+        if current_state is not None:
+            current_state.update()
+            current_state.clear(screen.image, screen.background)
+            dirty = current_state.draw(screen.image)
+            pg.display.update(dirty)
 
-        dirty = group.draw(screen.image)
-        pg.display.update(dirty)
-        pg.display.flip()
 
-        if stepper:
-            step = False
+def bind_and_run(func, args):
+    bound = inspect.signature(func).bind(**vars(args))
+    return func(*bound.args, **bound.kwargs)
 
 def main():
     """
     ZPype: A clone of ZType, http://zty.pe
     """
     parser = argparse.ArgumentParser(prog='zpype', description=main.__doc__)
+    parser.add_argument('--words', type=argparse.FileType(), default='words.txt')
     parser.add_argument('--stepper', action='store_true',
             help='Start game in step mode. TAB to step, SHIFT+TAB to toggle'
                  ' stepping.')
     args = parser.parse_args()
 
-    bound = inspect.signature(run).bind(**vars(args))
-    run(*bound.args, **bound.kwargs)
+    words = [line.strip() for line in args.words if len(line.strip()) > 2]
+    del args.words
+
+    global game
+    game = Game(words, 4)
+    args.state = IntroState
+    engine = bind_and_run(Engine, args)
+    engine.run()
 
 if __name__ == '__main__':
     main()
