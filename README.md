@@ -6,9 +6,12 @@ http://zty.pe
 
 Copied from here:
 
-https://10fastfingers.com/text/816-100-most-common-English-words
+https://github.com/first20hours/google-10000-english/blob/master/google-10000-english-no-swears.txt
 
 # TODO
 * win/lose condition
 * increasing difficuly
 * bells and whistles
+
+# IDEAS
+* enemies shoot you when you miss
