@@ -1,6 +1,5 @@
 # ZPype
-Python 3 clone of ZType
-
+Very rudimentry Python 3 clone of ZType
 http://zty.pe
 
 # Dictionary
