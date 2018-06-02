@@ -632,6 +632,11 @@ class GameState(State):
                 for sprite in group.sprites():
                     if isinstance(sprite, LetterSprite) and sprite.letter == letter:
                         self.shoot_at(group.ship)
+                        # TODO: whatever's being typed at show be above; and
+                        #       this below isn't working. the sprites stop
+                        #       moving and being shot at.
+                        #for sprite in group.sprites():
+                        #    sprite._layer += 1
                         sprite.kill()
                         break
                 return
@@ -677,6 +682,7 @@ class Sprite(pg.sprite.DirtySprite):
         self.image = Surface((0,0))
         self.rect = self.image.get_rect()
         self.active = True
+        self._layer = 0
 
     def update(self):
         self.rect.update()
