@@ -19,8 +19,6 @@ PAD = 10
 TYPE2NAME = {eventtype: pg.event.event_name(eventtype).upper()
               for eventtype in range(pg.NOEVENT, pg.NUMEVENTS)
               if pg.event.event_name(eventtype) not in ('Unknown',)}
-SWITCH = pg.USEREVENT
-TYPE2NAME[SWITCH] = 'SWITCH'
 EVENT_METHOD_PREFIX = "on_"
 
 BIG_SHIP = (64, 32)
@@ -30,20 +28,14 @@ SHIP_CHOICES = list()
 SHIP_CHOICES.extend((SMALL_SHIP, ) * 10)
 SHIP_CHOICES.extend((BIG_SHIP, ) * 1)
 
-class G:
-    current_state = None
-    dt = None
-    font = None
-    game = None
-    player = None
-    screen = None
-    spawnrect = None
-
-
-g = G()
-
 def loggername(inst):
     return '.'.join([MODULENAME, inst.__class__.__name__])
+
+def getlogger(inst):
+    logger = logging.getLogger(loggername(inst))
+    for f in logger.parent.filters:
+        logger.addFilter(f)
+    return logger
 
 def scaled(iter, x):
     return tuple(v * x for v in iter)
@@ -246,9 +238,13 @@ class Rect(pg.Rect):
         return rect
 
     def random(self, inside):
-        x = random.randint(inside.left, inside.right - self.width)
-        y = random.randint(inside.top, inside.bottom - self.height)
-        return self.copy(topleft=(x,y))
+        # XXX: clamping here because `self.width` and `self.height` might make
+        #      `b` for `random.randint` less than `a`. there's probably a
+        #      better way.
+        x = random.randint(inside.left, inside.right)
+        y = random.randint(inside.top, inside.bottom)
+        rect = self.copy(topleft=(x,y))
+        return Rect(rect.clamp(inside))
 
     def update(self):
         if self.driver.iterable:
@@ -271,6 +267,19 @@ class Surface(pg.Surface):
 
 class Group(pg.sprite.LayeredDirty):
 
+    def allgroups(self):
+        """
+        Return a set of all groups.
+        """
+        found = set()
+        groups = []
+        for sprite in g.sprites.sprites():
+            for group in sprite.groups():
+                if group not in found:
+                    found.add(group)
+                    groups.append(group)
+        return groups
+
     def boundingrect(self):
         if len(self):
             rects = [sprite.rect for sprite in self.sprites()]
@@ -286,6 +295,7 @@ class Group(pg.sprite.LayeredDirty):
             ox, oy = rect.x - _rect.x, rect.y - _rect.y
             for sprite in self.sprites():
                 sprite.rect.move_ip(ox, oy)
+                # update x, y if exists
                 try:
                     sprite.x = sprite.rect.centerx
                     sprite.y = sprite.rect.centery
@@ -297,42 +307,10 @@ class Group(pg.sprite.LayeredDirty):
         if rect:
             self.position(rect.copy(*args, **kwargs))
 
-    def spritesgroups(self):
-        found = set()
-        groups = []
-        for sprite in self.sprites():
-            for group in sprite.groups():
-                if group not in found:
-                    found.add(group)
-                    groups.append(group)
-        return groups
-
     def update(self, *args):
-        for sprite in self.sprites():
+        for sprite in g.sprites.sprites():
             if sprite.active:
                 sprite.update(*args)
-
-
-class Brain(UserList):
-    """
-    Stack-based finite state machine.
-    """
-    def __init__(self, body, initial=None):
-        super().__init__()
-        self.body = body
-        if initial:
-            self.append(initial)
-
-    def push(self, func):
-        self.append(func)
-
-    @property
-    def current(self):
-        return None if not self else self[-1]
-
-    def update(self):
-        if self.current:
-            self.current()
 
 
 class EventHandler:
@@ -341,6 +319,13 @@ class EventHandler:
         self.name = name
         self.method = method
         self.enabled = enabled
+        self.logger = getlogger(self)
+
+    def __bool__(self):
+        return bool(self.method)
+
+    def __call__(self, event):
+        return self.method(event)
 
     def disable(self):
         self.enabled = False
@@ -354,15 +339,15 @@ class EventHandler:
 
 class EventHandlerGroup(UserDict):
 
-    def disable(self, event_name):
+    def disable(self):
         for handler in self.values():
             handler.disable()
 
-    def enable(self, event_name):
+    def enable(self):
         for handler in self.values():
             handler.enable()
 
-    def toggle(self, event_name):
+    def toggle(self):
         for handler in self.values():
             handler.toggle()
 
@@ -372,47 +357,59 @@ class EventHandlerGroup(UserDict):
                     for type, name in TYPE2NAME.items()})
 
 
-class State(Group):
+class StateStack(UserList):
 
-    brain_class = Brain
+    def append(self, state):
+        if self:
+            self[-1].exit()
+        super().append(state)
+        state.enter()
 
-    def __init__(self, *sprites, brain_class=None):
-        super().__init__(*sprites)
-        if brain_class is None:
-            brain_class = self.brain_class
-        self.brain = brain_class(self)
-        self.logger = logging.getLogger(loggername(self))
+    def pop(self):
+        state = super().pop()
+        state.exit()
+        if self:
+            self[-1].enter()
+        return state
 
+
+class State:
+
+    def __init__(self):
+        self.brain = list()
         self.eventhandlers = EventHandlerGroup.from_instance(self)
+        self.logger = getlogger(self)
+        self.saved_sprites = Group()
 
     def enter(self):
+        """
+        Add this state's sprites back to the global sprites.
+        """
+        # called by StateStack when appened to stack, or when this becomes the
+        # topmost from a pop transitioning stuff must be done before this.
         self.logger.info('enter')
-        self._saved_sprites = getattr(self, '_saved_sprites', self.sprites())
-        for sprite in self._saved_sprites:
-            self.add(sprite)
+        for sprite in self.saved_sprites:
+            g.sprites.add(sprite)
 
     def exit(self):
+        """
+        Remove this instance's sprites from global sprites, saving them.
+        """
+        # called by StateStack when popped or when an append makes this the
+        # state underneath the topmost. transitioning state
         self.logger.info('exit')
-        self._saved_sprites = []
-        for sprite in self.sprites():
-            self.remove(sprite)
-            self._saved_sprites.append(sprite)
-
-    def _on(self, event):
-        """
-        Return the method to hanle `event`.
-        """
-        self.logger.info('_on: %s', event)
-        handler = self.eventhandlers[TYPE2NAME[event.type]]
-        if handler.enabled:
-            return handler.method(event)
+        for sprite in self.saved_sprites.sprites():
+            g.sprites.remove(sprite)
+            self.saved_sprites.add(sprite)
 
     def update(self, *args):
-        super().update(*args)
-        self.brain.update()
+        if self.brain:
+            method = self.brain[-1]
+            if method:
+                method()
 
 
-class IntroState(State):
+class MainmenuState(State):
     """
     Introduce player and present main menu.
     """
@@ -428,27 +425,38 @@ class IntroState(State):
 
         self.play.rect.top = self.logo.rect.move(0, PAD).bottom
         self.quit.rect.top = self.play.rect.move(0, PAD).bottom
+        g.sprites.add(g.player, self.logo, self.play, self.quit)
 
-        self.introiter = None
-        self.add(g.player, self.logo, self.play, self.quit)
+        self.slide = g.screen.rect.inflate(g.screen.rect.width*8,0)
 
     def enter(self):
         super().enter()
-        self.begin_intro()
+        self.eventhandlers.enable()
+        self.intro_init()
 
-    def begin_intro(self):
-        # slide menu items on from left
-        inside = (g.screen.rect
-                   # width * 2
-                   .inflate(g.screen.rect.width*2,0)
-                   # right side on center
-                   .copy(right=g.screen.rect.centerx))
+    def intro_init(self):
+        self.logger.info('intro_init')
+        duration = 1
+        # slide the logo in from the right
+        rect = self.logo.rect
+        # NOTE: saving final position of logo because when we reenter this
+        #       function, logo will have been positioned somewhere else and
+        #       we're using it to position the player.
+        logofinal = rect.copy(centerx=self.slide.centerx)
+        rect.driver.run(
+            util.lerpsiter(
+                rect.copy(right=self.slide.right).midleft,
+                logofinal.midleft,
+                duration
+            ),
+            attr='midleft'
+        )
         # slide "play" in from left to center
         self.play.rect.driver.run(
             util.lerpsiter(
-                self.play.rect.copy(centerx=inside.left).midleft,
-                self.play.rect.copy(centerx=inside.right).midleft,
-                1
+                self.play.rect.copy(left=self.slide.left).midleft,
+                self.play.rect.copy(centerx=self.slide.centerx).midleft,
+                duration
             ),
             attr='midleft'
         )
@@ -457,62 +465,113 @@ class IntroState(State):
             it.chain(
                 # delay a bit
                 util.lerpsiter(
-                    self.quit.rect.copy(centerx=inside.left).midleft,
-                    self.quit.rect.copy(centerx=inside.left).midleft,
-                    .25
+                    self.quit.rect.copy(left=self.slide.left).midleft,
+                    self.quit.rect.copy(left=self.slide.left).midleft,
+                    duration / 4
                 ),
                 util.lerpsiter(
-                    self.quit.rect.copy(centerx=inside.left).midleft,
-                    self.quit.rect.copy(centerx=inside.right).midleft,
-                    1
+                    self.quit.rect.copy(left=self.slide.left).midleft,
+                    self.quit.rect.copy(centerx=self.slide.centerx).midleft,
+                    duration
                 ),
             ),
             attr='midleft'
         )
-
         # player intro
-        self.introiter = it.chain(
-            zip(it.repeat(g.screen.rect.centerx),
-                util.lerpiter(g.screen.rect.top - g.player.sprite.rect.height,
-                         self.quit.rect.bottom + PAD,
-                         0.5)),
-            zip(it.repeat(g.screen.rect.centerx),
-                util.lerpiter(self.quit.rect.bottom + PAD,
-                         self.logo.rect.top + PAD - g.player.sprite.rect.height,
-                         1)))
-
-        g.player.sprite.rect.driver.run(
-            it.chain(
+        rect = g.player.sprite.rect
+        i = it.chain(
                 util.lerpsiter(
-                    g.player.sprite.rect.copy(midbottom=g.screen.rect.midtop).center,
-                    g.player.sprite.rect.copy(midtop=g.screen.rect.midbottom).center,
-                    1,
+                    rect.copy(midbottom=g.screen.rect.midtop).center,
+                    rect.copy(midtop=g.screen.rect.midbottom).center,
+                    duration,
                     lerpfunc=util.sinlerp),
                 util.lerpsiter(
-                    g.player.sprite.rect.copy(midtop=g.screen.rect.midbottom).center,
-                    g.player.sprite.rect.copy(midbottom=self.logo.rect.midtop).center,
-                    1,
+                    rect.copy(midtop=g.screen.rect.midbottom).center,
+                    rect.copy(midbottom=logofinal.midtop).center,
+                    duration,
                     lerpfunc=util.sinlerp)
-            ),
-            attr='center',
+            )
+        i, j = it.tee(i)
+        if g.dt is None:
+            g.dt = 15
+        print(list(j))
+        rect.driver.run(
+            i,
+            attr='center'
         )
-
-        self.brain.push(self.intro)
+        self.brain.append(self.intro)
 
     def intro(self):
         if not g.player.sprite.rect.driver.iterable:
             self.logger.info("exit intro")
             self.brain.pop()
 
+    def outro_init(self):
+        self.logger.info('outro_init')
+        duration = 1
+        # slide player down
+        rect = g.player.sprite.rect
+        rect.driver.run(
+            util.lerpsiter(
+                rect.copy().midbottom,
+                rect.copy(bottom=g.screen.rect.bottom - PAD).midbottom,
+                duration
+            ),
+            attr='midbottom'
+        )
+        # slide logo off
+        rect = self.logo.rect
+        rect.driver.run(
+            util.lerpsiter(
+                rect.copy().midleft,
+                rect.copy(left=self.slide.left).midleft,
+                duration
+            ),
+            attr='midleft'
+        )
+        # slide "play" off
+        rect = self.play.rect
+        rect.driver.run(
+            util.lerpsiter(
+                rect.midleft,
+                rect.copy(right=self.slide.right).midleft,
+                duration
+            ),
+            attr='midleft'
+        )
+        # slide "quit" off
+        rect = self.quit.rect
+        rect.driver.run(
+            it.chain(
+                # hold
+                util.lerpsiter(rect.midleft, rect.midleft, .25),
+                util.lerpsiter(
+                    rect.midleft,
+                    rect.copy(right=self.slide.right).midleft,
+                    duration
+                ),
+            ),
+            attr='midleft'
+        )
+        self.eventhandlers.disable()
+        self.brain.append(self.outro)
+
+    def outro(self):
+        """
+        Switch to GameState when quit is done animating.
+        """
+        if not self.quit.rect.driver.iterable:
+            self.logger.info("switching to GameState")
+            self.brain.pop()
+            g.statestack.append(GameState())
+
     def on_KEYDOWN(self, event):
         self.logger.info('KEYDOWN')
         if event.key == pg.K_ESCAPE:
             pg.event.post(Event(pg.QUIT))
         elif event.key == pg.K_RETURN:
-            pg.event.post(Event(SWITCH, state=GameState))
-        # TODO: remove below
-        elif event.key == pg.K_r:
-            self.begin_intro()
+            # transition to gameplay
+            self.outro_init()
 
 
 class GameState(State):
@@ -521,99 +580,81 @@ class GameState(State):
     """
     def __init__(self):
         super().__init__()
-        self.introiter = None
-        self.add(g.player, self.brain)
+        self.enemies = Group()
+        g.sprites.add(g.player)
 
     def enter(self):
         super().enter()
-        self.logger.info(self.sprites())
-        self.begin_intro()
+        self.intro_init()
+        self.eventhandlers.enable()
 
-    def begin_intro(self):
-        rect = g.player.sprite.rect
-        rect.driver.run(
-            util.lerpsiter(
-                rect.midbottom,
-                rect.copy(bottom=g.screen.rect.bottom - PAD).midbottom,
-                1
-            ),
-            attr='midbottom'
-        )
-        self.logger.info('disabling keydown')
-        self.eventhandlers['KEYDOWN'].disable()
-        self.brain.push(self.intro)
+    def exit(self):
+        super().exit()
+        self.logger.info('exiting')
+        self.eventhandlers.disable()
+
+    def intro_init(self):
+        # XXX: when re-entering this state, it's paused.
+        self.logger.info('intro_init: disabling eventhandlers')
+        self.eventhandlers.disable()
+        self.brain.append(self.intro)
 
     def intro(self):
         if not g.player.sprite.rect.driver.iterable:
-            self.logger.info('enabling keydown')
-            self.eventhandlers['KEYDOWN'].enable()
+            self.logger.debug('intro: %s', g.player.sprite.rect)
             self.brain.pop()
+            self.gameplay_init()
 
-    def begin_outro(self):
-        self.eventhandlers['KEYDOWN'].disable()
-        keepx = it.repeat(g.player.sprite.rect.centerx)
-        up = g.player.sprite.rect.top - g.player.sprite.rect.height * 2
-        self.outroiter = it.chain(
-            zip(keepx, util.lerpiter(g.player.sprite.rect.top, up, .3)),
-            zip(keepx, util.lerpiter(up, g.screen.rect.bottom, .3)))
-        self.brain.push(self.outro)
+    def gameplay_init(self):
+        self.logger.info('gameplay_init: enabling eventhandlers')
+        self.logger.debug('gameplay_init: %s', g.player.sprite.rect)
+        self.eventhandlers.enable()
+        self.brain.append(self.gameplay)
+
+    def gameplay(self):
+        """
+        Spawn more EnemyGroup groups if there's no Enemy subclass sprites left.
+        """
+        self.logger.debug('gameplay, %s', g.player.sprite.rect)
+        if not any(isinstance(sprite, Enemy) for sprite in g.sprites.sprites()):
+            self.do_spawn()
+
+    def outro_init(self):
+        self.eventhandlers.disable()
+        # fly player off screen, up
+        duration = 1
+        rect = g.player.sprite.rect
+        rect.driver.run(
+            it.chain(
+                util.lerpsiter(
+                    rect.center,
+                    rect.copy(midtop=g.screen.rect.midbottom).center,
+                    duration / 8,
+                    lerpfunc=util.sinlerp),
+                util.lerpsiter(
+                    rect.copy(midtop=g.screen.rect.midtop).center,
+                    rect.copy(midbottom=g.screen.rect.midtop).center,
+                    duration,
+                    lerpfunc=util.sinlerp)
+            ),
+            attr='center',
+        )
+        self.brain.append(self.outro)
 
     def outro(self):
-        try:
-            g.player.sprite.rect.midtop = next(self.outroiter)
-        except StopIteration:
-            self.eventhandlers['KEYDOWN'].enable()
+        """
+        Wait for player to fly off.
+        """
+        if not g.player.sprite.rect.driver.iterable:
             self.brain.pop()
-            pg.event.post(Event(SWITCH, state=IntroState))
-
-    def begin_pause(self):
-        pass
-
-    def pause(self):
-        pass
-
-    def get_sprites_to_pause(self):
-        """
-        Return sprites that should be paused on pausing.
-        """
-        for sprite in self.sprites():
-            if isinstance(sprite, (Enemy, Effect)):
-                yield sprite
-
-    def do_exit(self):
-        self.logger.info('exiting')
-        self.begin_outro()
-        self.logger.info(self.brain.current)
-
-    def do_pause(self):
-        self.logger.info('pausing')
-        for sprite in self.get_sprites_to_pause():
-            sprite.active = False
-        self.resume = LogoSprite("Escape to resume")
-        self.quit = LogoSprite("Enter to quit")
-        self.quit.rect.midtop = self.resume.rect.move(0, PAD).midbottom
-        group = Group(self.resume, self.quit)
-        group.positioned(center=g.screen.rect.center)
-        self.add(group)
-        self.brain.push(self.pause)
-
-    def do_resume(self):
-        self.logger.info('resuming')
-        self.brain.pop()
-        self.quit.kill()
-        self.resume.kill()
-        for sprite in self.get_sprites_to_pause():
-            sprite.active = True
+            for enemy in self.enemies.sprites():
+                enemy.kill()
+            g.statestack.pop()
 
     def on_KEYDOWN(self, event):
         if event.key == pg.K_ESCAPE:
-            if self.brain.current == self.pause:
-                self.do_resume()
-            else:
-                self.do_pause()
-        elif event.key == pg.K_RETURN:
-            if self.brain.current == self.pause:
-                self.do_exit()
+            # pause
+            g.statestack.append(GamePauseState())
         elif event.unicode:
             self.do_typed(event.unicode)
 
@@ -621,20 +662,20 @@ class GameState(State):
         bullet = Bullet(ship)
         bullet.rect.midbottom = g.player.sprite.rect.midtop
         bullet.start = bullet.rect.copy()
-        self.add(bullet)
+        g.sprites.add(bullet)
 
     def kill_letter(self, word, letter):
-        for group in self.spritesgroups():
+        for group in g.sprites.allgroups():
             if (isinstance(group, EnemyGroup) and group.word == word):
                 group.word = group.word[1:]
                 if getattr(self, 'typing_at', None) is None:
-                    self.add(Target(group.ship))
+                    g.sprites.add(Target(group.ship))
                 for sprite in group.sprites():
                     if isinstance(sprite, LetterSprite) and sprite.letter == letter:
                         self.shoot_at(group.ship)
-                        # TODO: whatever's being typed at show be above; and
-                        #       this below isn't working. the sprites stop
-                        #       moving and being shot at.
+                        # TODO: whatever's being typed at should be above the
+                        #       other sprites; and this below isn't working.
+                        #       the sprites stop moving and being shot at.
                         #for sprite in group.sprites():
                         #    sprite._layer += 1
                         sprite.kill()
@@ -653,25 +694,60 @@ class GameState(State):
                 self.typing_at = g.game.hit_word(self.typing_at)
 
     def do_spawn(self):
-        if self.brain.current == self.intro:
-            return
+        """
+        Spawn new wave of Enemy sprites.
+        """
+        self.logger.info('do_spawn')
         g.game.spawnmax()
         for word in g.game.active_words:
             size = random.choice(SHIP_CHOICES)
             enemygroup = EnemyGroup(word, size)
-
             bounding = enemygroup.boundingrect()
             enemygroup.position(bounding.random(g.spawnrect))
+            g.sprites.add(enemygroup)
+            self.enemies.add(enemygroup)
 
-            self.add(enemygroup)
 
-    def update(self):
+class GamePauseState(State):
+
+    def __init__(self):
+        super().__init__()
+        self.resume = LogoSprite("Escape to resume")
+        self.quit = LogoSprite("Enter to quit")
+        self.quit.rect.midtop = self.resume.rect.move(0, PAD).midbottom
+        self.pause_group = Group(self.resume, self.quit)
+        self.pause_group.positioned(center=g.screen.rect.center)
+
+    def get_sprites_to_pause(self):
         """
-        Spawn more EnemyGroup groups if there's no Enemy subclass sprites left.
+        Return sprites that should be paused on pausing.
         """
-        super().update()
-        if not any(isinstance(sprite, Enemy) for sprite in self.sprites()):
-            self.do_spawn()
+        for sprite in g.sprites.sprites():
+            if isinstance(sprite, (Enemy, Effect)):
+                yield sprite
+
+    def enter(self):
+        self.logger.info('enter')
+        for sprite in self.get_sprites_to_pause():
+            sprite.active = False
+        g.sprites.add(self.pause_group)
+
+    def exit(self):
+        self.logger.info('exit')
+        self.quit.kill()
+        self.resume.kill()
+        for sprite in self.get_sprites_to_pause():
+            sprite.active = True
+        g.sprites.remove(self.pause_group)
+
+    def on_KEYDOWN(self, event):
+        if event.key == pg.K_ESCAPE:
+            # unpause
+            g.statestack.pop()
+        elif event.key == pg.K_RETURN:
+            # quit to main menu
+            g.statestack.pop()
+            g.statestack[-1].outro_init()
 
 
 class Sprite(pg.sprite.DirtySprite):
@@ -816,7 +892,7 @@ class Bullet(Sprite):
             if self.target.health == 0:
                 self.target.kill()
 
-                explosion = Explosion( self.target.rect.center, endradius=min(g.screen.rect.size)/2)
+                explosion = Explosion(self.target.rect.center, endradius=min(g.screen.rect.size)/2)
                 for group in self.groups():
                     group.add(explosion)
             else:
@@ -873,7 +949,7 @@ class EnemyShip(Sprite, Enemy):
             ls2.rect.left = ls1.rect.right
         self.lettergroup.positioned(midtop=self.rect.midbottom)
 
-        self.speedmultiplier = 1.25
+        self.speedmultiplier = 1
         self.x, self.y = self.rect.center
 
     def update(self):
@@ -895,10 +971,24 @@ class EnemyGroup(Enemy, Group):
         self.add(self.ship)
 
 
+class G:
+    # setup by Engine
+    dt = None
+    font = None
+    screen = None
+    spawnrect = None
+
+    game = Group()
+    player = PlayerGroup()
+    sprites = Group()
+    statestack = StateStack()
+
+g = G()
+
 class Engine:
 
-    def __init__(self, state, stepper=False):
-        self.logger = logging.getLogger(loggername(self))
+    def __init__(self, stepper=False):
+        self.logger = getlogger(self)
         self.npass, self.nfail = pg.init()
         self.logger.info('npass: %s, nfail: %s', self.npass, self.nfail)
 
@@ -908,8 +998,6 @@ class Engine:
                 height=g.screen.rect.height * .3,
                 midbottom=g.screen.rect.midtop)
 
-        g.player = PlayerGroup()
-
         self.stepper = stepper
         self.do_step = not self.stepper
 
@@ -918,16 +1006,7 @@ class Engine:
         self.buffered_events = deque()
         self.running = False
 
-        self.state_instances = {}
-        pg.event.post(Event(SWITCH, state=state))
-
-    def run(self):
-        self.running = True
-        while self.running:
-            self.step()
-
-    def _on(self, event):
-        return get_event_method(self, event.type)
+        self.eventhandlers = EventHandlerGroup.from_instance(self)
 
     def on_KEYDOWN(self, event):
         self.logger.info('on_KEYDOWN: %s', event)
@@ -946,35 +1025,32 @@ class Engine:
         self.logger.info('on_QUIT: %s', event)
         self.running = False
 
-    def on_SWITCH(self, event):
-        self.logger.info('on_SWITCH: %s', event)
-        if g.current_state is not None:
-            g.current_state.exit()
-            g.current_state.clear(g.screen.image, g.screen.background)
-            dirty = g.current_state.draw(g.screen.image)
-            pg.display.update(dirty)
-
-        state = event.state
-        if callable(event.state):
-            state = event.state()
-
-        class_  = type(state)
-        if class_ in self.state_instances:
-            g.current_state = self.state_instances[class_]
-        else:
-            g.current_state = state
-            self.state_instances[class_] = state
-
-        g.current_state.enter()
-
     def handle_event(self, event):
-        for obj in [self, g.current_state]:
-            method = get_event_method(obj, event.type)
-            self.logger.info('handle_event: %s, %s', event, method)
-            if method is not None and obj._on(event):
-                method(event)
+        """
+        Find and event handler on this class or the current state and call it,
+        passing the event.
+        """
+        self.logger.info('handle_event: %s', event)
+
+        event_name = TYPE2NAME[event.type]
+        handler = self.eventhandlers.get(event_name, None)
+        if handler and handler.enabled:
+            handler(event)
+
+        if g.statestack:
+            handler = g.statestack[-1].eventhandlers.get(event_name, None)
+            if handler and handler.enabled:
+                handler(event)
+
+    def run(self):
+        self.running = True
+        while self.running:
+            self.step()
 
     def step(self):
+        """
+        Process a single frame step.
+        """
         g.dt = self.clock.tick()
 
         events = pg.event.get()
@@ -987,10 +1063,11 @@ class Engine:
         for event in events:
             self.handle_event(event)
 
-        if self.do_step and g.current_state is not None:
-            g.current_state.update()
-            g.current_state.clear(g.screen.image, g.screen.background)
-            dirty = g.current_state.draw(g.screen.image)
+        if self.do_step and g.statestack:
+            g.statestack[-1].update()
+            g.sprites.update()
+            g.sprites.clear(g.screen.image, g.screen.background)
+            dirty = g.sprites.draw(g.screen.image)
             pg.display.update(dirty)
 
         if self.stepper:
@@ -1007,28 +1084,31 @@ def main():
     """
     parser = argparse.ArgumentParser(prog='zpype', description=main.__doc__)
     parser.add_argument('--words', type=argparse.FileType(), default='words.txt')
-    parser.add_argument('--logging', action='store_true')
-    parser.add_argument('--filter', default='', help='Only show logging from this name. %(default)s')
+    parser.add_argument('--logging')
+    parser.add_argument('--filter', nargs='+', default='',
+                        help='Only show logging from this name. %(default)s')
     parser.add_argument('--stepper', action='store_true',
-            help='Start game in step mode. TAB to step, SHIFT+TAB to toggle'
-                 ' stepping.')
+                        help='Start game in step mode. TAB to step, SHIFT+TAB'
+                             ' to toggle stepping.')
     args = parser.parse_args()
 
     words = [line.strip() for line in args.words if len(line.strip()) > 2]
     del args.words
 
-    if args.logging:
-        logging.basicConfig(level=logging.INFO)
+    if args.logging or args.filter:
+        logging.basicConfig(level=getattr(logging, args.logging))
     del args.logging
 
+    # XXX: multiple filters not working
     if args.filter:
-        # TODO: this isn't working to filter out loggers.
-        logging.getLogger(MODULENAME).addFilter(args.filter)
+        logger = logging.getLogger(MODULENAME)
+        for name in args.filter:
+            logger.addFilter(logging.Filter(name))
     del args.filter
 
-    g.game = Game(words, 4)
-    args.state = IntroState
     engine = bind_and_run(Engine, args)
+    g.game = Game(words, 4)
+    g.statestack.append(MainmenuState())
     engine.run()
 
 if __name__ == '__main__':
