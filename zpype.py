@@ -479,7 +479,8 @@ class MainmenuState(State):
         )
         # player intro
         rect = g.player.sprite.rect
-        i = it.chain(
+        rect.driver.run(
+            it.chain(
                 util.lerpsiter(
                     rect.copy(midbottom=g.screen.rect.midtop).center,
                     rect.copy(midtop=g.screen.rect.midbottom).center,
@@ -491,12 +492,6 @@ class MainmenuState(State):
                     duration,
                     lerpfunc=util.sinlerp)
             )
-        i, j = it.tee(i)
-        if g.dt is None:
-            g.dt = 15
-        print(list(j))
-        rect.driver.run(
-            i,
             attr='center'
         )
         self.brain.append(self.intro)
