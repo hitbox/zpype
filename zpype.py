@@ -185,6 +185,10 @@ class Event:
         return pg.event.Event(type, **attrs)
 
 
+class Font(pg.font.Font):
+    pass
+
+
 class Screen:
 
     def __init__(self, size):
@@ -1039,10 +1043,7 @@ class Engine:
         self.logger.info('npass: %s, nfail: %s', self.npass, self.nfail)
 
         g.screen = Screen(SCREENSIZE)
-        g.font = pg.font.Font(None, FONTSIZE)
-        g.spawnrect = g.screen.rect.copy(
-                height=g.screen.rect.height * .3,
-                midbottom=g.screen.rect.midtop)
+        g.font = Font(None, FONTSIZE)
 
         self.stepper = stepper
         self.do_step = not self.stepper
