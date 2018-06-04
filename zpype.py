@@ -710,8 +710,7 @@ class GameState(State):
         self.logger.info('do_spawn')
         g.game.spawnmax()
         for word in g.game.active_words:
-            size = random.choice(SHIP_CHOICES)
-            enemygroup = EnemyGroup(word, size)
+            enemygroup = EnemyGroup.random(word)
             bounding = enemygroup.boundingrect()
             enemygroup.position(bounding.random(g.spawnrect))
             g.sprites.add(enemygroup)
@@ -1019,6 +1018,11 @@ class EnemyGroup(Enemy, Group):
         self.ship = EnemyShip(word, size)
         self.add(self.ship.lettergroup)
         self.add(self.ship)
+
+    @classmethod
+    def random(cls, word):
+        size = random.choice(SHIP_CHOICES)
+        return cls(word, size)
 
 
 class G:
