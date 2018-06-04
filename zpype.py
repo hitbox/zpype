@@ -505,8 +505,8 @@ class MainmenuState(State):
                     rect.copy(midtop=g.screen.rect.midbottom).center,
                     rect.copy(midbottom=logofinal.midtop).center,
                     duration,
-                    lerpfunc=util.sinlerp)
-            )
+                    lerpfunc=util.coslerp)
+            ),
             attr='center'
         )
         self.brain.append(self.intro)
@@ -525,7 +525,8 @@ class MainmenuState(State):
             util.lerpsiter(
                 rect.copy().midbottom,
                 rect.copy(bottom=g.screen.rect.bottom - PAD).midbottom,
-                duration
+                duration,
+                lerpfunc=util.sinlerp
             ),
             attr='midbottom'
         )
@@ -632,18 +633,19 @@ class GameState(State):
     def outro_init(self):
         self.eventhandlers.disable()
         # fly player off screen, up
+        inside = g.screen.rect.inflate(scaled(g.screen.rect.size, 4))
         duration = 1
         rect = g.player.sprite.rect
         rect.driver.run(
             it.chain(
                 util.lerpsiter(
                     rect.center,
-                    rect.copy(midtop=g.screen.rect.midbottom).center,
-                    duration / 8,
+                    rect.copy(midbottom=rect.midtop).center,
+                    duration,
                     lerpfunc=util.sinlerp),
                 util.lerpsiter(
-                    rect.copy(midtop=g.screen.rect.midtop).center,
-                    rect.copy(midbottom=g.screen.rect.midtop).center,
+                    rect.copy(midbottom=rect.midtop).center,
+                    rect.copy(midtop=inside.midbottom).center,
                     duration,
                     lerpfunc=util.sinlerp)
             ),
@@ -1048,6 +1050,8 @@ class Engine:
 
         g.screen = Screen(SCREENSIZE)
         g.font = Font(None, FONTSIZE)
+        g.spawnrect = g.screen.rect.copy(height=g.screen.rect.height * .3,
+                                         midbottom=g.screen.rect.midtop)
 
         self.stepper = stepper
         self.do_step = not self.stepper
