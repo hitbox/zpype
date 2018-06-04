@@ -109,9 +109,11 @@ def deltato(pos1, pos2, speed=1):
     dx = pos2[0] - pos1[0]
     dy = pos2[1] - pos1[1]
     length = math.sqrt(dx * dx + dy * dy)
-    dx /= length
-    dy /= length
-    return (dx * speed, dy * speed)
+    if abs(length) > 0:
+        dx /= length
+        dy /= length
+        return (dx * speed, dy * speed)
+    return (0, 0)
 
 class draw:
 
