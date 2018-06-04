@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pygame as pg
 
+tau = math.pi * 2
+
 MODULENAME = Path(__file__).stem
 
 SCREENSIZE = (500, 1000)
@@ -55,6 +57,13 @@ class util:
     def coslerp(a, b, t):
         f = (1 - math.cos(t * math.pi / 2))
         return a * (1 - f) + b * f
+
+    @staticmethod
+    def lerprange(a, b, step):
+        t = 0
+        while t <= 1:
+            yield util.lerp(a, b, t)
+            t += step
 
     @staticmethod
     def lerpiter(a, b, duration, lerpfunc=None):
@@ -664,7 +673,7 @@ class GameState(State):
             if (isinstance(group, EnemyGroup) and group.word == word):
                 group.word = group.word[1:]
                 if getattr(self, 'typing_at', None) is None:
-                    g.sprites.add(Target(group.ship))
+                    g.sprites.add(PolygonTarget(group.ship, 6))
                 for sprite in group.sprites():
                     if isinstance(sprite, LetterSprite) and sprite.letter == letter:
                         self.shoot_at(group.ship)
@@ -844,6 +853,46 @@ class Target(Effect):
         self.image = image = Surface(self.rect.size)
         color = Color('white', alpha=alpha)
         draw.circle(image, color, image.get_rect().center, radius, width)
+
+
+class PolygonTarget(Effect):
+
+    def __init__(self, target, sides, duration=.5, startradius=None, endradius=None):
+        super().__init__()
+        self.target = target
+        self.sides = sides
+        if startradius is None:
+            startradius = min(g.screen.rect.size)
+        if endradius is None:
+            endradius = 1
+        self.radiusiter = util.lerpiter(startradius, endradius, duration)
+        self.widthiter = util.lerpiter(8, 1, duration)
+        self.alphaiter = util.lerpiter(255, 125, duration)
+        self.angles = tuple(util.lerprange(0, tau, 1/self.sides))
+        self.rotation = 0
+        self.rotation_step = math.radians(2)
+
+    def update(self):
+        super().update()
+        try:
+            radius = int(next(self.radiusiter))
+            width = int(next(self.widthiter))
+            alpha = int(next(self.alphaiter))
+        except StopIteration:
+            self.kill()
+            return
+        points = tuple((radius + math.cos(angle + self.rotation) * radius,
+                        radius + math.sin(angle + self.rotation) * radius)
+                        for angle in self.angles)
+        diameter = radius * 2
+        self.image = Surface((diameter, diameter))
+        color = Color('gold', alpha=alpha)
+        pg.draw.polygon(self.image, color, points, width)
+
+        self.rect = self.image.get_rect()
+        self.rect.center = self.target.rect.center
+
+        self.rotation += self.rotation_step
 
 
 class PlayerSprite(Sprite):
