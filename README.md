@@ -12,6 +12,9 @@ https://github.com/first20hours/google-10000-english/blob/master/google-10000-en
 * win/lose condition
 * increasing difficuly
 * bells and whistles
+* inkscape scripting in Python?
 
 ## IDEAS
 * enemies shoot you when you miss
+* very long words for health
+* missles as a reword that explode and take out nearby enemies

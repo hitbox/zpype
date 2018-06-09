@@ -1,210 +1,171 @@
 import argparse
 import inspect
-import itertools as it
-import logging
 import math
+import operator
 import random
-from collections import OrderedDict, UserDict, UserList, defaultdict, deque
+import string
+from collections import UserList, UserString, namedtuple
+from functools import partial
+from operator import methodcaller
 from pathlib import Path
 
 import pygame as pg
 
-tau = math.pi * 2
+class Word:
 
-MODULENAME = Path(__file__).stem
+    def __init__(self, text):
+        self.text = text
+        self.initial = text
 
-SCREENSIZE = (500, 1000)
-FRAMERATE = 60
-FONTSIZE = 32
-PAD = 10
+    def __len__(self):
+        return len(self.text)
 
-TYPE2NAME = {eventtype: pg.event.event_name(eventtype).upper()
-              for eventtype in range(pg.NOEVENT, pg.NUMEVENTS)
-              if pg.event.event_name(eventtype) not in ('Unknown',)}
-EVENT_METHOD_PREFIX = "on_"
+    def __hash__(self):
+        return hash(self.text)
 
-BIG_SHIP = (64, 32)
-SMALL_SHIP = (32, 32)
+    def __bool__(self):
+        return bool(self.text)
 
-SHIP_CHOICES = list()
-SHIP_CHOICES.extend((SMALL_SHIP, ) * 10)
-SHIP_CHOICES.extend((BIG_SHIP, ) * 1)
+    def __getitem__(self, index):
+        return self.text[index]
 
-def loggername(inst):
-    return '.'.join([MODULENAME, inst.__class__.__name__])
+    def __eq__(self, other):
+        if isinstance(other, Word):
+            return self.text == other.text
+        else:
+            return self.text == other
 
-def getlogger(inst):
-    logger = logging.getLogger(loggername(inst))
-    for f in logger.parent.filters:
-        logger.addFilter(f)
-    return logger
+    def __ne__(self, other):
+        return not self.__eq__(other)
 
-def scaled(iter, x):
-    return tuple(v * x for v in iter)
+    def __lt__(self, other):
+        return self.text < other
 
-class util:
+    def __le__(self, other):
+        return self.text <= other
 
-    @staticmethod
-    def lerp(a, b, t):
-        return (1 - t) * a + t * b
+    def __gt__(self, other):
+        return self.text > other
 
-    @staticmethod
-    def sinlerp(a, b, t):
-        f = math.sin(t * math.pi / 2)
-        return (1 - f) * a + f * b
-
-    @staticmethod
-    def coslerp(a, b, t):
-        f = (1 - math.cos(t * math.pi / 2))
-        return a * (1 - f) + b * f
-
-    @staticmethod
-    def lerprange(a, b, step):
-        t = 0
-        while t <= 1:
-            yield util.lerp(a, b, t)
-            t += step
-
-    @staticmethod
-    def lerpiter(a, b, duration, lerpfunc=None):
-        if lerpfunc is None:
-            lerpfunc = util.lerp
-        time = 0
-        while time <= duration:
-            value = lerpfunc(a, b, time / duration)
-            yield value
-            time += g.dt / 1000
-        if time != duration:
-            yield lerpfunc(a, b, 1)
-
-    @staticmethod
-    def lerpsiter(seq1, seq2, duration, lerpfunc=None):
-        iters = list(util.lerpiter(a, b, duration, lerpfunc) for a, b in zip(seq1, seq2))
-        running = set(iters)
-        while running:
-            values = deque()
-            for index, iterator in enumerate(iters):
-                try:
-                    value = next(iterator)
-                except StopIteration:
-                    running.remove(iterator)
-                    iters[index] = it.repeat(value)
-                    value = next(iters[index])
-                finally:
-                    values.append(value)
-            if running:
-                yield tuple(values)
+    def __ge__(self, other):
+        return self.text >= other
 
 
-def get_event_method(inst, event_type, fallback=None):
+class TypingGame:
+
+    def __init__(self, vocabulary, minlength=3, maxlength=6):
+        self.vocabulary = [Word(word) for word in vocabulary]
+        self.minlength = minlength
+        self.maxlength = maxlength
+        self.current = []
+        self.lock = None
+
+    def allowable(self):
+        return list(word for word in self.vocabulary
+                         if self.minlength <= len(word) <= self.maxlength)
+
+    def spawn(self, nwords):
+        """
+        Return a list, length `nwords`, of randomly selected words from `vocabulary`.
+        """
+        # avoiding `set` and using `shuffle` to maintain predictable results
+        # when `random.seed` is set manually, for tests.
+
+        # it would be impossible to find more than 26 words starting with
+        # unique letters
+        assert nwords <= 26, f'nwords {nwords}, is greater than 26.'
+        soup = [word for word in self.allowable() if word not in self.current]
+        random.shuffle(soup)
+        spawned = []
+        while len(spawned) < nwords:
+            firstletters = set(existing[0] for existing in spawned)
+            for word in soup:
+                if word[0] not in firstletters:
+                    break
+            else:
+                # XXX: what to do when a word can't be found?
+                raise RuntimeError
+            spawned.append(word)
+            soup.remove(word)
+        return spawned
+
+    def shoot(self, letter):
+        assert len(letter) == 1
+
+        if self.lock is not None and not self.lock.text:
+            self.lock = None
+
+        if self.lock is None:
+            # try to find a new lock
+            for word in self.current:
+                if word and word[0] == letter:
+                    self.lock = word
+                    break
+            else:
+                self.lock = None
+
+        if self.lock is not None and letter == self.lock.text[0]:
+            self.lock.text = self.lock.text[1:]
+        else:
+            self.lock = None
+
+        return self.lock
+
+
+def instanceis(class_or_tuple, obj):
+    return isinstance(obj, class_or_tuple)
+
+def one(iterable, predicate):
     """
+    Assert only one result.
     """
-    return getattr(inst, EVENT_METHOD_PREFIX + TYPE2NAME[event_type], fallback)
+    results = []
+    for item in iterable:
+        if predicate(item):
+            results.append(item)
+    assert len(results) == 1
+    return results[0]
 
-def deltato(pos1, pos2, speed=1):
+def lerp(a, b, t):
+    return (1 - t) * a + t * b
+
+def lerps(itera, iterb, t):
     """
-    Return normalized vector from `pos1` to `pos2`, multiplied by `speed` as a
-    two-tuple.
+    Handle `lerp`ing iterables together.
     """
-    dx = pos2[0] - pos1[0]
-    dy = pos2[1] - pos1[1]
-    length = math.sqrt(dx * dx + dy * dy)
-    if abs(length) > 0:
-        dx /= length
-        dy /= length
-        return (dx * speed, dy * speed)
-    return (0, 0)
+    # no idea what to name this function
+    return tuple(lerp(a, b, t) for a, b, in zip(itera, iterb))
 
-class draw:
+class Global:
+    game = None
 
-    @staticmethod
-    def circle(surface, color, position, radius, width=0):
-        """
-        pygame.draw.circle supporting better width rendering.
-        """
-        if width == 0:
-            return pg.draw.circle(surface, color, position, radius, width)
-        pg.draw.circle(surface, color, position, radius, 0)
-        color = Color(*tuple(color))
-        color.a = 0
-        return pg.draw.circle(surface, color, position, radius - width, 0)
+    screen = None
+    clock = None
+    group = None
+    states = None
+
+    padding = None
 
 
-class Game:
+g = Global()
 
-    def __init__(self, words, maxspawn, minletters=3, maxletters=6):
-        self.dictionary = defaultdict(list)
-        for word in words:
-            self.dictionary[len(word)].append(word)
-        self.maxspawn = maxspawn
-        self.minletters = minletters
-        self.maxletters = maxletters
+def randomrect(rect, inside):
+    rect = rect.copy()
+    right = inside.right - rect.width
+    if right < inside.left:
+        right = inside.left
+    x = random.randint(inside.left, right)
+    bottom = inside.bottom - rect.height
+    if bottom < inside.top:
+        bottom = inside.top
+    y = random.randint(inside.top, bottom)
+    rect.topleft = (x, y)
+    return rect
 
-        self.active_words = []
-        self.typing_at = None
+class Surface(pg.Surface):
 
-    def find(self, letter):
-        """
-        Return the already locked word, or the first word starting with `letter`.
-        """
-        for word in self.active_words:
-            if word.startswith(letter):
-                return word
-
-    def hit_word(self, word):
-        """
-        Strip first letter from word, updating active_words, returning the new word.
-        """
-        index = self.active_words.index(word)
-        self.active_words[index] = self.active_words[index][1:]
-        if self.active_words[index] == '':
-            self.active_words.pop(index)
-            return None
-        return self.active_words[index]
-
-    def spawn(self, nletters):
-        """
-        Return a random word of length nletters from dictionary.
-        """
-        return random.choice(self.dictionary[nletters])
-
-    def spawnmax(self):
-        while len(self.active_words) < self.maxspawn:
-            nletters = random.randint(self.minletters, self.maxletters)
-            word = self.spawn(nletters)
-            if (word not in self.active_words
-                    and not any(existing.startswith(word[0])
-                                for existing in self.active_words)):
-                self.active_words.append(word)
-
-
-class Event:
-
-    def __new__(self, type, **attrs):
-        attrs.update(type=type)
-        return pg.event.Event(type, **attrs)
-
-
-class Font(pg.font.Font):
-    pass
-
-
-class Screen:
-
-    def __init__(self, size):
-        self.image = pg.display.set_mode(size)
-        self.rect = Rect(self.image.get_rect())
-        self.background = self.image.copy()
-
-
-class Clock:
-
-    def __init__(self, framerate):
-        self.framerate = framerate
-        self._clock = pg.time.Clock()
-
-    def tick(self):
-        return self._clock.tick(self.framerate)
+    def __init__(self, size, flags=pg.SRCALPHA):
+        super().__init__(size, flags)
 
 
 class Color(pg.Color):
@@ -214,162 +175,236 @@ class Color(pg.Color):
         self.a = alpha
 
 
-class Driver:
+class Font:
 
-    def __init__(self):
-        self.iterable = iter(tuple())
-        self.attr = 'center'
+    def __init__(self, *args):
+        self._font = pg.font.Font(*args)
 
-    def run(self, iterable, attr=None):
-        if attr is not None:
-            self.attr = attr
-        self.iterable = iterable
+    def render(self, *args):
+        images = []
+        for line in args[0].splitlines():
+            images.append(self._font.render(line, *args[1:]))
+        get_size = methodcaller('get_size')
+        widths, heights = zip(*map(get_size, images))
+        result = Surface((max(widths), sum(heights)))
+        y = 0
+        for image in images:
+            result.blit(image, (0, y))
+            y += image.get_height()
+        return result
 
-    def __iter__(self):
-        return self
+class Screen:
 
-    def __next__(self):
-        return next(self.iterable)
+    def __init__(self, size, background=None):
+        self.image = pg.display.set_mode(size)
+        self.rect = self.image.get_rect()
+        if background is None:
+            background = self.image.copy()
+
+        if background.get_size() != self.rect.size:
+            background = pg.transform.scale(background, self.rect.size)
+
+        self.background = background
+        self.image.blit(background, (0,0))
+
+
+class Clock:
+
+    def __init__(self, framerate):
+        self.framerate = framerate
+        self.dt = None
+        self._clock = pg.time.Clock()
+
+    def tick(self):
+        self.dt = self._clock.tick(self.framerate)
+        return self.dt
 
 
 class Rect(pg.Rect):
+    pass
 
-    def __init__(self, *args):
-        super().__init__(*args)
-        self.driver = Driver()
+def bluelaser():
+    path = Path("bluelaser.png")
+    image = pg.image.load(str(path))
+    return image
 
-    def copy(self, *args, **kwargs):
-        rect = Rect(super().copy())
-        modifiers = OrderedDict(args)
-        modifiers.update(kwargs)
-        for key, value in modifiers.items():
-            attr = getattr(rect, key)
-            if callable(attr):
-                rv = attr(*value)
-                if isinstance(rv, pg.Rect):
-                    rect = rv
-            else:
-                setattr(rect, key, value)
-        return rect
+def renderbackground(size):
+    starspath = Path("./assets/png/starsbackground.png")
+    assert starspath.exists()
+    tile = pg.image.load(str(starspath))
+    twidth, theight = tile.get_size()
 
-    def random(self, inside):
-        # XXX: clamping here because `self.width` and `self.height` might make
-        #      `b` for `random.randint` less than `a`. there's probably a
-        #      better way.
-        x = random.randint(inside.left, inside.right)
-        y = random.randint(inside.top, inside.bottom)
-        rect = self.copy(topleft=(x,y))
-        return Rect(rect.clamp(inside))
+    width, height = size
+    background = Surface(size)
+
+    for y in range(0, height, theight):
+        for x in range(0, width, twidth):
+            background.blit(tile, (x, y))
+
+    return background
+
+class Group(pg.sprite.Group):
+
+    def boundingrect(self, **attrs):
+        rects = [sprite.rect for sprite in self.sprites()]
+        lefts, tops, rights, bottoms = zip(*
+                (rect.topleft + rect.bottomright for rect in rects))
+        left = min(lefts)
+        top = min(tops)
+        bounding = Rect(left, top, max(rights) - left, max(bottoms) - top)
+        for name, value in attrs.items():
+            setattr(bounding, name, value)
+        return bounding
+
+    def moveasone(self, rect):
+        br = self.boundingrect()
+        ox, oy = rect.x - br.x, rect.y - br.y
+        for sprite in self.sprites():
+            sprite.rect.move_ip(ox, oy)
+
+
+class Sprite(pg.sprite.Sprite):
+    pass
+
+
+class Laser(Sprite):
+
+    def __init__(self, target, *groups):
+        super().__init__(*groups)
+        self.target = target
+        self._image = self.image = pg.image.load(str(Path('assets/png/bluelaser.png')))
+        self.rect = self.image.get_rect()
 
     def update(self):
-        if self.driver.iterable:
-            try:
-                value = next(self.driver)
-            except StopIteration:
-                self.driver.iterable = None
-            else:
-                setattr(self, self.driver.attr, value)
+        self.rect.center = lerps(self.rect.center, self.target.rect.center, .3)
+
+        dx, dy = (self.target.rect.centerx - self.rect.centerx,
+                  self.target.rect.centery - self.rect.centery)
+        angle = math.degrees(math.atan2(-dy, dx))
+        self.image = pg.transform.rotate(self._image, angle)
+
+        if self.rect.colliderect(self.target.rect):
+            self.kill()
+            self.target.kill()
 
 
-class Surface(pg.Surface):
+class Player(Sprite):
 
-    def __init__(self, size, flags=pg.SRCALPHA):
-        super().__init__(size, flags)
+    def __init__(self, *groups):
+        super().__init__(*groups)
+        x = min(g.screen.rect.size)
+        self.image = Surface((x/16, x/8))
+        self.image.fill(Color('brown'))
+        self.rect = self.image.get_rect()
 
-    def get_rect(self, **attrs):
-        return Rect(super().get_rect(**attrs))
+
+class Enemy(Sprite):
+    pass
 
 
-class Group(pg.sprite.LayeredDirty):
+class EnemyShip(Enemy):
 
-    def allgroups(self):
-        """
-        Return a set of all groups.
-        """
-        found = set()
-        groups = []
-        for sprite in g.sprites.sprites():
-            for group in sprite.groups():
-                if group not in found:
-                    found.add(group)
-                    groups.append(group)
-        return groups
+    def __init__(self, *groups):
+        super().__init__(*groups)
+        x = min(g.screen.rect.size)
+        self.image = Surface((x/16, x/16))
+        self.image.fill(Color('purple'))
+        self.rect = self.image.get_rect()
 
-    def boundingrect(self):
-        if len(self):
-            rects = [sprite.rect for sprite in self.sprites()]
-            x, y = (min(rect.left for rect in rects),
-                    min(rect.top for rect in rects))
-            width = max(rect.right for rect in rects) - x
-            height = max(rect.bottom for rect in rects) - y
-            return Rect(x, y, width, height)
-
-    def position(self, rect):
-        _rect = self.boundingrect()
-        if _rect:
-            ox, oy = rect.x - _rect.x, rect.y - _rect.y
-            for sprite in self.sprites():
-                sprite.rect.move_ip(ox, oy)
-                # update x, y if exists
-                try:
-                    sprite.x = sprite.rect.centerx
-                    sprite.y = sprite.rect.centery
-                except AttributeError:
-                    pass
-
-    def positioned(self, *args, **kwargs):
-        rect = self.boundingrect()
-        if rect:
-            self.position(rect.copy(*args, **kwargs))
+        self.x, self.y = None, None
 
     def update(self, *args):
-        for sprite in g.sprites.sprites():
-            if sprite.active:
-                sprite.update(*args)
+        if self.x is None:
+            self.x = self.rect.x
+        if self.y is None:
+            self.y = self.rect.y
+        dx, dy = g.player.rect.centerx - self.x, g.player.rect.centery - self.y
+        length = math.hypot(dx, dy)
+        if length != 0:
+            dx /= length
+            dy /= length
+        self.x += dx
+        self.y += dy
+        self.rect.centerx = self.x
+        self.rect.centery = self.y
 
 
-class EventHandler:
+class LetterSprite(Enemy):
 
-    def __init__(self, name, method, enabled=True):
-        self.name = name
-        self.method = method
-        self.enabled = enabled
-        self.logger = getlogger(self)
+    def __init__(self, ourship, letter, *groups):
+        super().__init__(*groups)
+        self.ourship = ourship
+        self.letter = letter
+        font = Font(None, int(min(g.screen.rect.size)/16))
+        self.image = font.render(self.letter, True, Color('white'))
+        self.rect = self.image.get_rect()
+        self.offset = None
 
-    def __bool__(self):
-        return bool(self.method)
+    def update(self, *args):
+        if self.offset is None:
+            self.offset = (self.rect.x - self.ourship.rect.x,
+                           self.rect.y - self.ourship.rect.y)
 
-    def __call__(self, event):
-        return self.method(event)
-
-    def disable(self):
-        self.enabled = False
-
-    def enable(self):
-        self.enabled = True
-
-    def toggle(self):
-        self.enabled = not self.enabled
+        ox, oy = self.offset
+        self.rect.topleft = (self.ourship.rect.x + ox,
+                             self.ourship.rect.y + oy)
 
 
-class EventHandlerGroup(UserDict):
+class LetterGroup(Group):
 
-    def disable(self):
-        for handler in self.values():
-            handler.disable()
+    def __init__(self, ourship, letters, *sprites):
+        super().__init__(*sprites)
+        self.ourship = ourship
+        self.letters = letters
+        self.lettersprites = []
+        x = 0
+        for letter in self.letters:
+            sprite = LetterSprite(self.ourship, letter)
+            sprite.rect.x = x
+            x += sprite.rect.width
+            self.add(sprite)
+            self.lettersprites.append(sprite)
 
-    def enable(self):
-        for handler in self.values():
-            handler.enable()
 
-    def toggle(self):
-        for handler in self.values():
-            handler.toggle()
+class BackgroundSprite(Sprite):
 
-    @classmethod
-    def from_instance(cls, inst):
-        return cls({name: EventHandler(name, get_event_method(inst, type))
-                    for type, name in TYPE2NAME.items()})
+    def __init__(self, lockto, *groups):
+        super().__init__(*groups)
+        self.lockto = lockto
+        self.offset = None
+
+    def update(self, *args):
+        if self.offset is None:
+            self.offset = (self.lockto.rect.x - self.rect.x,
+                           self.lockto.rect.y - self.rect.y)
+        self.rect.topleft = (self.lockto.rect.x - self.offset[0],
+                             self.lockto.rect.y - self.offset[1])
+
+
+class EnemyGroup(Group):
+
+    def __init__(self, word, *sprites):
+        super().__init__(*sprites)
+        self.word = word
+        self.ship = EnemyShip()
+        self.lettergroup = LetterGroup(self.ship, list(self.word), self)
+
+        pad = g.padding//4
+        bounding = self.lettergroup.boundingrect()
+
+        self.shade = BackgroundSprite(self.ship)
+        self.shade.image = Surface(bounding.inflate(pad, pad).size)
+        self.shade.image.fill(Color('black', alpha=200))
+        self.shade.rect = self.shade.image.get_rect()
+        self.shade.rect.midtop = self.ship.rect.move(0, pad).midbottom
+
+        bounding.center = self.shade.rect.center
+
+        self.lettergroup.moveasone(bounding)
+
+        # NOTE: lettergroup needs to update first, to catch the intended,
+        #       initial, offset from the ship.
+        self.add(self.shade, self.lettergroup, self.ship)
 
 
 class StateStack(UserList):
@@ -388,783 +423,321 @@ class StateStack(UserList):
         return state
 
 
+class EventHandler:
+
+    def __init__(self, method, enabled=True):
+        self.method = method
+        self.enabled = enabled
+
+    def __call__(self, event):
+        return self.method(event)
+
+
 class State:
 
     def __init__(self):
-        self.brain = list()
-        self.eventhandlers = EventHandlerGroup.from_instance(self)
-        self.logger = getlogger(self)
-        self.saved_sprites = Group()
+        self.methodstack = list()
+
+        self.eventhandlers = {}
+        for name in dir(self):
+            attr = getattr(self, name)
+            if inspect.ismethod(attr) and name.startswith('on_'):
+                self.eventhandlers[name] = EventHandler(attr)
 
     def enter(self):
-        """
-        Add this state's sprites back to the global sprites.
-        """
-        # called by StateStack when appened to stack, or when this becomes the
-        # topmost from a pop transitioning stuff must be done before this.
-        self.logger.info('enter')
-        for sprite in self.saved_sprites:
-            g.sprites.add(sprite)
+        pass
 
     def exit(self):
-        """
-        Remove this instance's sprites from global sprites, saving them.
-        """
-        # called by StateStack when popped or when an append makes this the
-        # state underneath the topmost. transitioning state
-        self.logger.info('exit')
-        for sprite in self.saved_sprites.sprites():
-            g.sprites.remove(sprite)
-            self.saved_sprites.add(sprite)
-
-    def update(self, *args):
-        if self.brain:
-            method = self.brain[-1]
-            if method:
-                method()
-
-
-class MainmenuState(State):
-    """
-    Introduce player and present main menu.
-    """
-    def __init__(self):
-        super().__init__()
-        self.logo = LogoSprite("ZPype", 6)
-        self.logo.rect.center = g.screen.rect.center
-
-        self.play = LogoSprite("Enter to play", 2)
-        self.quit = LogoSprite("Escape to quit", 2)
-
-        rect = self.play.image.get_rect()
-
-        self.play.rect.top = self.logo.rect.move(0, PAD).bottom
-        self.quit.rect.top = self.play.rect.move(0, PAD).bottom
-        g.sprites.add(g.player, self.logo, self.play, self.quit)
-
-        self.slide = g.screen.rect.inflate(g.screen.rect.width*8,0)
-
-    def enter(self):
-        super().enter()
-        self.eventhandlers.enable()
-        self.intro_init()
-
-    def intro_init(self):
-        self.logger.info('intro_init')
-        duration = 1
-        # slide the logo in from the right
-        rect = self.logo.rect
-        # NOTE: saving final position of logo because when we reenter this
-        #       function, logo will have been positioned somewhere else and
-        #       we're using it to position the player.
-        logofinal = rect.copy(centerx=self.slide.centerx)
-        rect.driver.run(
-            util.lerpsiter(
-                rect.copy(right=self.slide.right).midleft,
-                logofinal.midleft,
-                duration
-            ),
-            attr='midleft'
-        )
-        # slide "play" in from left to center
-        self.play.rect.driver.run(
-            util.lerpsiter(
-                self.play.rect.copy(left=self.slide.left).midleft,
-                self.play.rect.copy(centerx=self.slide.centerx).midleft,
-                duration
-            ),
-            attr='midleft'
-        )
-        # slide "quit" in from left to center
-        self.quit.rect.driver.run(
-            it.chain(
-                # delay a bit
-                util.lerpsiter(
-                    self.quit.rect.copy(left=self.slide.left).midleft,
-                    self.quit.rect.copy(left=self.slide.left).midleft,
-                    duration / 4
-                ),
-                util.lerpsiter(
-                    self.quit.rect.copy(left=self.slide.left).midleft,
-                    self.quit.rect.copy(centerx=self.slide.centerx).midleft,
-                    duration
-                ),
-            ),
-            attr='midleft'
-        )
-        # player intro
-        rect = g.player.sprite.rect
-        rect.driver.run(
-            it.chain(
-                util.lerpsiter(
-                    rect.copy(midbottom=g.screen.rect.midtop).center,
-                    rect.copy(midtop=g.screen.rect.midbottom).center,
-                    duration,
-                    lerpfunc=util.sinlerp),
-                util.lerpsiter(
-                    rect.copy(midtop=g.screen.rect.midbottom).center,
-                    rect.copy(midbottom=logofinal.midtop).center,
-                    duration,
-                    lerpfunc=util.coslerp)
-            ),
-            attr='center'
-        )
-        self.brain.append(self.intro)
-
-    def intro(self):
-        if not g.player.sprite.rect.driver.iterable:
-            self.logger.info("exit intro")
-            self.brain.pop()
-
-    def outro_init(self):
-        self.logger.info('outro_init')
-        duration = 1
-        # slide player down
-        rect = g.player.sprite.rect
-        rect.driver.run(
-            util.lerpsiter(
-                rect.copy().midbottom,
-                rect.copy(bottom=g.screen.rect.bottom - PAD).midbottom,
-                duration,
-                lerpfunc=util.sinlerp
-            ),
-            attr='midbottom'
-        )
-        # slide logo off
-        rect = self.logo.rect
-        rect.driver.run(
-            util.lerpsiter(
-                rect.copy().midleft,
-                rect.copy(left=self.slide.left).midleft,
-                duration
-            ),
-            attr='midleft'
-        )
-        # slide "play" off
-        rect = self.play.rect
-        rect.driver.run(
-            util.lerpsiter(
-                rect.midleft,
-                rect.copy(right=self.slide.right).midleft,
-                duration
-            ),
-            attr='midleft'
-        )
-        # slide "quit" off
-        rect = self.quit.rect
-        rect.driver.run(
-            it.chain(
-                # hold
-                util.lerpsiter(rect.midleft, rect.midleft, .25),
-                util.lerpsiter(
-                    rect.midleft,
-                    rect.copy(right=self.slide.right).midleft,
-                    duration
-                ),
-            ),
-            attr='midleft'
-        )
-        self.eventhandlers.disable()
-        self.brain.append(self.outro)
-
-    def outro(self):
-        """
-        Switch to GameState when quit is done animating.
-        """
-        if not self.quit.rect.driver.iterable:
-            self.logger.info("switching to GameState")
-            self.brain.pop()
-            g.statestack.append(GameState())
-
-    def on_KEYDOWN(self, event):
-        self.logger.info('KEYDOWN')
-        if event.key == pg.K_ESCAPE:
-            pg.event.post(Event(pg.QUIT))
-        elif event.key == pg.K_RETURN:
-            # transition to gameplay
-            self.outro_init()
-
-
-class GameState(State):
-    """
-    Playing the space-shooter typing game.
-    """
-    def __init__(self):
-        super().__init__()
-        self.enemies = Group()
-        g.sprites.add(g.player)
-
-    def enter(self):
-        super().enter()
-        self.intro_init()
-        self.eventhandlers.enable()
-
-    def exit(self):
-        super().exit()
-        self.logger.info('exiting')
-        self.eventhandlers.disable()
-
-    def intro_init(self):
-        # XXX: when re-entering this state, it's paused.
-        self.logger.info('intro_init: disabling eventhandlers')
-        self.eventhandlers.disable()
-        self.brain.append(self.intro)
-
-    def intro(self):
-        if not g.player.sprite.rect.driver.iterable:
-            self.logger.debug('intro: %s', g.player.sprite.rect)
-            self.brain.pop()
-            self.gameplay_init()
-
-    def gameplay_init(self):
-        self.logger.info('gameplay_init: enabling eventhandlers')
-        self.logger.debug('gameplay_init: %s', g.player.sprite.rect)
-        self.eventhandlers.enable()
-        self.brain.append(self.gameplay)
-
-    def gameplay(self):
-        """
-        Spawn more EnemyGroup groups if there's no Enemy subclass sprites left.
-        """
-        self.logger.debug('gameplay, %s', g.player.sprite.rect)
-        if not any(isinstance(sprite, Enemy) for sprite in g.sprites.sprites()):
-            self.do_spawn()
-
-    def outro_init(self):
-        self.eventhandlers.disable()
-        # fly player off screen, up
-        inside = g.screen.rect.inflate(scaled(g.screen.rect.size, 4))
-        duration = 1
-        rect = g.player.sprite.rect
-        rect.driver.run(
-            it.chain(
-                util.lerpsiter(
-                    rect.center,
-                    rect.copy(midbottom=rect.midtop).center,
-                    duration,
-                    lerpfunc=util.sinlerp),
-                util.lerpsiter(
-                    rect.copy(midbottom=rect.midtop).center,
-                    rect.copy(midtop=inside.midbottom).center,
-                    duration,
-                    lerpfunc=util.sinlerp)
-            ),
-            attr='center',
-        )
-        self.brain.append(self.outro)
-
-    def outro(self):
-        """
-        Wait for player to fly off.
-        """
-        if not g.player.sprite.rect.driver.iterable:
-            self.brain.pop()
-            for enemy in self.enemies.sprites():
-                enemy.kill()
-            g.statestack.pop()
-
-    def on_KEYDOWN(self, event):
-        if event.key == pg.K_ESCAPE:
-            # pause
-            g.statestack.append(GamePauseState())
-        elif event.unicode:
-            self.do_typed(event.unicode)
-
-    def shoot_at(self, ship):
-        bullet = Bullet(ship)
-        bullet.rect.midbottom = g.player.sprite.rect.midtop
-        bullet.start = bullet.rect.copy()
-        g.sprites.add(bullet)
-
-    def kill_letter(self, word, letter):
-        for group in g.sprites.allgroups():
-            if (isinstance(group, EnemyGroup) and group.word == word):
-                group.word = group.word[1:]
-                if getattr(self, 'typing_at', None) is None:
-                    g.sprites.add(PolygonTarget(group.ship, 6))
-                for sprite in group.sprites():
-                    if isinstance(sprite, LetterSprite) and sprite.letter == letter:
-                        self.shoot_at(group.ship)
-                        # TODO: whatever's being typed at should be above the
-                        #       other sprites; and this below isn't working.
-                        #       the sprites stop moving and being shot at.
-                        #for sprite in group.sprites():
-                        #    sprite._layer += 1
-                        sprite.kill()
-                        break
-                return
-
-    def do_typed(self, letter):
-        if getattr(self, 'typing_at', None) is None:
-            word = g.game.find(letter)
-            if word:
-                self.kill_letter(word, letter)
-                self.typing_at = g.game.hit_word(word)
-        else:
-            if self.typing_at.startswith(letter):
-                self.kill_letter(self.typing_at, letter)
-                self.typing_at = g.game.hit_word(self.typing_at)
-
-    def do_spawn(self):
-        """
-        Spawn new wave of Enemy sprites.
-        """
-        self.logger.info('do_spawn')
-        g.game.spawnmax()
-        for word in g.game.active_words:
-            enemygroup = EnemyGroup.random(word)
-            bounding = enemygroup.boundingrect()
-            enemygroup.position(bounding.random(g.spawnrect))
-            g.sprites.add(enemygroup)
-            self.enemies.add(enemygroup)
-
-
-class GamePauseState(State):
-
-    def __init__(self):
-        super().__init__()
-        self.resume = LogoSprite("Escape to resume")
-        self.quit = LogoSprite("Enter to quit")
-        self.quit.rect.midtop = self.resume.rect.move(0, PAD).midbottom
-        self.pause_group = Group(self.resume, self.quit)
-        self.pause_group.positioned(center=g.screen.rect.center)
-
-    def get_sprites_to_pause(self):
-        """
-        Return sprites that should be paused on pausing.
-        """
-        for sprite in g.sprites.sprites():
-            if isinstance(sprite, (Enemy, Effect)):
-                yield sprite
-
-    def enter(self):
-        self.logger.info('enter')
-        for sprite in self.get_sprites_to_pause():
-            sprite.active = False
-        g.sprites.add(self.pause_group)
-
-    def exit(self):
-        self.logger.info('exit')
-        self.quit.kill()
-        self.resume.kill()
-        for sprite in self.get_sprites_to_pause():
-            sprite.active = True
-        g.sprites.remove(self.pause_group)
-
-    def on_KEYDOWN(self, event):
-        if event.key == pg.K_ESCAPE:
-            # unpause
-            g.statestack.pop()
-        elif event.key == pg.K_RETURN:
-            # quit to main menu
-            g.statestack.pop()
-            g.statestack[-1].outro_init()
-
-
-class Sprite(pg.sprite.DirtySprite):
-
-    def __init__(self):
-        super().__init__()
-        self.dirty = 2
-        self.image = Surface((0,0))
-        self.rect = self.image.get_rect()
-        self.active = True
-        self._layer = 0
+        pass
 
     def update(self):
-        self.rect.update()
+        if self.methodstack:
+            self.methodstack[-1]()
 
-
-class LogoSprite(Sprite):
-
-    def __init__(self, text, scale=1):
-        super().__init__()
-        image = g.font.render(text, True, Color('white'))
-        self.image = pg.transform.scale(image, scaled(image.get_size(), scale))
-        self.rect = Rect(self.image.get_rect())
-
-
-class Effect(Sprite):
-
-    def __init__(self):
-        super().__init__()
-
-
-class Explosion(Effect):
-
-    def __init__(self, position, duration=.5, startradius=None, endradius=None):
-        super().__init__()
-        self.x, self.y = position
-
-        if startradius is None:
-            startradius = 1
-        if endradius is None:
-            endradius = min(g.screen.rect.size) / 8
-
-        self.radiusiter = util.lerpiter(startradius, endradius, duration)
-        self.widthiter = util.lerpiter(0, 0, duration)
-        self.alphaiter = util.lerpiter(200, 0, duration)
-
-        rect = self.rect = Rect(0, 0, startradius * 2, startradius * 2)
-        rect.center = (self.x, self.y)
-        self.image = Surface(self.rect.size)
-
-    def update(self):
-        super().update()
-        try:
-            radius = int(next(self.radiusiter))
-            width = int(next(self.widthiter))
-            alpha = int(next(self.alphaiter))
-        except StopIteration:
-            self.kill()
-            return
-
-        self.rect.size = (radius * 2, ) * 2
-        self.rect.center = (self.x, self.y)
-        self.image = image = Surface(self.rect.size)
-        color = Color('gold', alpha=alpha)
-        draw.circle(image, color, image.get_rect().center, radius, width)
-
-
-class Target(Effect):
-
-    def __init__(self, target, duration=.5, startradius=None, endradius=None):
-        super().__init__()
-        self.target = target
-
-        if startradius is None:
-            startradius = min(g.screen.rect.size)
-        if endradius is None:
-            endradius = 1
-
-        self.radiusiter = util.lerpiter(startradius, endradius, duration)
-        self.widthiter = util.lerpiter(16, 1, duration)
-        self.alphaiter = util.lerpiter(255, 125, duration)
-
-        rect = self.rect = Rect(0, 0, startradius * 2, startradius * 2)
-        rect.center = self.target.rect.center
-        self.image = Surface(self.rect.size)
-
-    def update(self):
-        super().update()
-        try:
-            radius = int(next(self.radiusiter))
-            width = int(next(self.widthiter))
-            alpha = int(next(self.alphaiter))
-        except StopIteration:
-            self.kill()
-            return
-
-        self.rect.size = (radius * 2, ) * 2
-        self.rect.center = self.target.rect.center
-        self.image = image = Surface(self.rect.size)
-        color = Color('white', alpha=alpha)
-        draw.circle(image, color, image.get_rect().center, radius, width)
-
-
-class PolygonTarget(Effect):
-
-    def __init__(self, target, sides, duration=.5, startradius=None, endradius=None):
-        super().__init__()
-        self.target = target
-        self.sides = sides
-        if startradius is None:
-            startradius = min(g.screen.rect.size)
-        if endradius is None:
-            endradius = 1
-        self.radiusiter = util.lerpiter(startradius, endradius, duration)
-        self.widthiter = util.lerpiter(8, 1, duration)
-        self.alphaiter = util.lerpiter(255, 125, duration)
-        self.angles = tuple(util.lerprange(0, tau, 1/self.sides))
-        self.rotation = 0
-        self.rotation_step = math.radians(2)
-
-    def update(self):
-        super().update()
-        try:
-            radius = int(next(self.radiusiter))
-            width = int(next(self.widthiter))
-            alpha = int(next(self.alphaiter))
-        except StopIteration:
-            self.kill()
-            return
-        points = tuple((radius + math.cos(angle + self.rotation) * radius,
-                        radius + math.sin(angle + self.rotation) * radius)
-                        for angle in self.angles)
-        diameter = radius * 2
-        self.image = Surface((diameter, diameter))
-        color = Color('gold', alpha=alpha)
-        pg.draw.polygon(self.image, color, points, width)
-
-        self.rect = self.image.get_rect()
-        self.rect.center = self.target.rect.center
-
-        self.rotation += self.rotation_step
-
-
-class PlayerSprite(Sprite):
-
-    def __init__(self):
-        super().__init__()
-        self._layer = 1
-        self.image = Surface((32, 64))
-        self.image.fill(Color('red'))
-        self.rect = self.image.get_rect()
-
-
-class PlayerGroup(Group):
-
-    def __init__(self):
-        super().__init__()
-        self.sprite = PlayerSprite()
-        self.add(self.sprite)
-
-
-class Bullet(Sprite):
-
-    def __init__(self, target):
-        super().__init__()
-        self.target = target
-        self.image = Surface((8, 8))
-        draw.circle(self.image,
-                    Color('white'),
-                    self.image.get_rect().center,
-                    min(self.image.get_size()) // 2)
-        self.rect = self.image.get_rect()
-        self.time = 0
-        self.duration = .25
-        self.start = self.rect.copy()
-
-    def update(self):
-        super().update()
-        self.time += g.dt / 1000
-        if self.time >= self.duration:
-            self.target.health -= 1
-            if self.target.health == 0:
-                self.target.kill()
-
-                explosion = Explosion(self.target.rect.center, endradius=min(g.screen.rect.size)/2)
-                for group in self.groups():
-                    group.add(explosion)
-            else:
-                explosion = Explosion(self.target.rect.center)
-                for group in self.groups():
-                    group.add(explosion)
-
-            self.kill()
-
-        t = self.time / self.duration
-        self.rect.x = util.lerp(self.start.x, self.target.rect.centerx, t)
-        self.rect.y = util.lerp(self.start.y, self.target.rect.centery, t)
-
-
-class LetterSprite(Sprite):
-
-    def __init__(self, letter):
-        super().__init__()
-        self.letter = letter
-        self.image = g.font.render(letter, True, Color('white'), Color(0,0,0,25))
-        self.rect = Rect(self.image.get_rect())
-
-
-class LetterGroup(Group):
-
-    def __init__(self, word):
-        super().__init__()
-        for letter in word:
-            self.add(LetterSprite(letter))
-
-
-class Enemy:
-    pass
-
-
-class EnemyShip(Sprite, Enemy):
-
-    def __init__(self, word, size):
-        super().__init__()
-        self.word = word
-        self.health = len(word)
-
-        self.lettergroup = LetterGroup(word)
-        self.image = Surface(size)
-        draw.circle(self.image,
-                    Color('red'),
-                    self.image.get_rect().center,
-                    min(self.image.get_size()) // 2)
-        self.rect = self.image.get_rect()
-        self.x, self.y = self.rect.center
-
-        lettersprites = self.lettergroup.sprites()
-        for ls1, ls2 in zip(lettersprites[:-1], lettersprites[1:]):
-            ls2.rect.left = ls1.rect.right
-        self.lettergroup.positioned(midtop=self.rect.midbottom)
-
-        self.speedmultiplier = 1
-        self.x, self.y = self.rect.center
-
-    def update(self):
-        super().update()
-        dx, dy = deltato(self.rect.center, g.player.sprite.rect.center, self.speedmultiplier)
-        self.x += dx
-        self.y += dy
-        self.rect.center = (self.x, self.y)
-        self.lettergroup.positioned(midtop=self.rect.midbottom)
-
-
-class EnemyGroup(Enemy, Group):
-
-    def __init__(self, word, size):
-        super().__init__()
-        self.word = word
-        self.ship = EnemyShip(word, size)
-        self.add(self.ship.lettergroup)
-        self.add(self.ship)
-
-    @classmethod
-    def random(cls, word):
-        size = random.choice(SHIP_CHOICES)
-        return cls(word, size)
-
-
-class G:
-    # setup by Engine
-    dt = None
-    font = None
-    screen = None
-    spawnrect = None
-
-    game = Group()
-    player = PlayerGroup()
-    sprites = Group()
-    statestack = StateStack()
-
-g = G()
 
 class Engine:
 
-    def __init__(self, stepper=False):
-        self.logger = getlogger(self)
+    def __init__(self, screensize, framerate=60, background=None):
         self.npass, self.nfail = pg.init()
-        self.logger.info('npass: %s, nfail: %s', self.npass, self.nfail)
 
-        g.screen = Screen(SCREENSIZE)
-        g.font = Font(None, FONTSIZE)
-        g.spawnrect = g.screen.rect.copy(height=g.screen.rect.height * .3,
-                                         midbottom=g.screen.rect.midtop)
+        g.screen = Screen(screensize, background=background)
+        g.clock = Clock(framerate)
+        g.group = Group()
+        g.states = StateStack()
+        g.padding = min(g.screen.rect.size) / 12
 
-        self.stepper = stepper
-        self.do_step = not self.stepper
-
-        self.clock = Clock(FRAMERATE)
-
-        self.buffered_events = deque()
         self.running = False
 
-        self.eventhandlers = EventHandlerGroup.from_instance(self)
-
-    def on_KEYDOWN(self, event):
-        self.logger.info('on_KEYDOWN: %s', event)
-        if (event.type == pg.KEYDOWN
-                and event.key == pg.K_TAB
-                and (event.mod & pg.KMOD_SHIFT)):
-            self.stepper = not self.stepper
-            if not self.stepper:
-                self.do_step = True
-        elif (event.type == pg.KEYDOWN
-                and event.key == pg.K_TAB
-                and not (event.mod & pg.KMOD_SHIFT)):
-            self.do_step = True
-
-    def on_QUIT(self, event):
-        self.logger.info('on_QUIT: %s', event)
-        self.running = False
-
-    def handle_event(self, event):
-        """
-        Find and event handler on this class or the current state and call it,
-        passing the event.
-        """
-        self.logger.info('handle_event: %s', event)
-
-        event_name = TYPE2NAME[event.type]
-        handler = self.eventhandlers.get(event_name, None)
-        if handler and handler.enabled:
-            handler(event)
-
-        if g.statestack:
-            handler = g.statestack[-1].eventhandlers.get(event_name, None)
-            if handler and handler.enabled:
-                handler(event)
-
-    def run(self):
+    def run(self, states):
+        try:
+            for state in states:
+                g.states.append(state)
+        except TypeError:
+            g.states.append(states)
         self.running = True
         while self.running:
             self.step()
 
     def step(self):
-        """
-        Process a single frame step.
-        """
-        g.dt = self.clock.tick()
+        g.clock.tick()
+        for event in pg.event.get():
+            if event.type == pg.QUIT:
+                self.running = False
+                return
+            else:
+                event_name = "on_" + pg.event.event_name(event.type)
+                handler = g.states[-1].eventhandlers.get(event_name)
+                if handler is not None and handler.enabled:
+                    handler(event)
+        g.states[-1].update()
+        g.group.update()
+        g.group.clear(g.screen.image, g.screen.background)
+        dirty = g.group.draw(g.screen.image) or g.screen.rect
+        pg.display.update(dirty)
 
-        events = pg.event.get()
-        if self.do_step:
-            while self.buffered_events:
-                events.insert(0, self.buffered_events.popleft())
+
+class SimpleSprite(Sprite):
+
+    def __init__(self, *groups):
+        super().__init__(*groups)
+        self.image = Surface((64, 64))
+        self.image.fill(Color('red'))
+        self.rect = self.image.get_rect()
+
+
+class SimpleTestState(State):
+
+    def enter(self):
+        sprite = SimpleSprite()
+        sprite.rect = sprite.image.get_rect(center=g.screen.rect.center)
+        g.group.add(sprite)
+
+        font = Font(None, int(min(g.screen.rect.size) / 12))
+        message = Sprite()
+        message.image = font.render("There should be a red box\n"
+                                    "in the middle of the screen.",
+                                    True, Color('white'))
+        message.rect = message.image.get_rect(midtop=g.screen.rect.midtop)
+        g.group.add(message)
+
+    def on_KeyDown(self, event):
+        if event.key == pg.K_ESCAPE:
+            pg.event.post(pg.event.Event(pg.QUIT))
+
+
+def current_player():
+    return getattr(g, 'player', None)
+
+def current_player_or_new():
+    return current_player() or Player()
+
+class GameplayState(State):
+
+    def enter(self):
+        player = current_player_or_new()
+        player.rect.midbottom = g.screen.rect.midtop
+        g.player = player
+        g.group.add(player)
+
+        self.t = 0
+        self.enemygroups = []
+
+        self.methodstack.append(self.playing)
+        self.methodstack.append(self.spawn)
+        self.eventhandlers['on_KeyDown'].enabled = False
+        self.methodstack.append(self.intro)
+
+    def playing(self):
+        for enemygroup in self.enemygroups:
+            if not any(isinstance(sprite, LetterSprite) for sprite in enemygroup.sprites()):
+                for sprite in enemygroup.sprites():
+                    sprite.kill()
+
+    def intro(self):
+        if self.t <= 1:
+            g.player.rect.midbottom = lerps(
+                    g.screen.rect.midtop,
+                    g.screen.rect.midbottom,
+                    self.t)
+            self.t += .025
         else:
-            self.buffered_events.extend(events)
+            self.eventhandlers['on_KeyDown'].enabled = True
+            self.methodstack.pop()
 
-        for event in events:
-            self.handle_event(event)
+    def spawn(self):
+        spawned_words = g.game.spawn(4)
+        g.game.current.extend(spawned_words)
 
-        if self.do_step and g.statestack:
-            g.statestack[-1].update()
-            g.sprites.update()
-            g.sprites.clear(g.screen.image, g.screen.background)
-            dirty = g.sprites.draw(g.screen.image)
-            pg.display.update(dirty)
+        spawnrect = g.screen.rect.copy()
+        spawnrect.height /= 4
+        spawnrect.midbottom = g.screen.rect.midtop
 
-        if self.stepper:
-            self.do_step = False
+        for word in spawned_words:
+            enemygroup = EnemyGroup(word)
+
+            # randomly position the group
+            while True:
+                position = randomrect(enemygroup.boundingrect(), spawnrect)
+                # generate until not colliding
+                if not any(position.colliderect(sprite.rect) for sprite in g.group.sprites()):
+                    enemygroup.moveasone(position)
+                    break
+
+            self.enemygroups.append(enemygroup)
+            g.group.add(enemygroup)
+
+        self.methodstack.pop()
+
+    def has_enemies(self):
+        # TODO: left off here, there are still enemies after all the letter
+        #       sprites have been `kill`ed. so it's never respawning.
+        #       also move words.txt to assets dir.
+        return any(isinstance(sprite, Enemy) for sprite in g.group.sprites())
+
+    def is_playing(self):
+        """
+        """
+        return self.methodstack[-1] == self.playing
+
+    def shoot(self, letter):
+        word = g.game.shoot(letter)
+        if word is not None:
+            target = None
+            for sprite in g.group.sprites():
+                if isinstance(sprite, LetterSprite):
+                    if sprite.letter == letter:
+                        for group in sprite.groups():
+                            if isinstance(group, EnemyGroup):
+                                if group.word.initial == word.initial:
+                                    target = sprite
+                                    break
+                if target is not None:
+                    break
+
+            laser = Laser(target)
+            laser.rect.midbottom = g.player.rect.midtop
+            g.group.add(laser)
+
+            if not self.has_enemies():
+                self.methodstack.append(self.spawn)
+
+    def on_KeyDown(self, event):
+        if event.key == pg.K_ESCAPE:
+            pg.event.post(pg.event.Event(pg.QUIT))
+        elif (self.is_playing()
+                and event.unicode in string.ascii_lowercase):
+            self.shoot(event.unicode)
 
 
-def bind_and_run(func, args):
-    bound = inspect.signature(func).bind(**vars(args))
-    return func(*bound.args, **bound.kwargs)
+def repeated_letters(word):
+    return all(letter == word[0] for letter in word)
+
+def wordfilter(word):
+    return not repeated_letters(word)
+
+def getwords():
+    strip = methodcaller('strip')
+    with open("words.txt") as words_file:
+        return list(word
+                    for word in map(strip, words_file.readlines())
+                    if wordfilter(word))
+
+def testlerp():
+    assert lerp(0, 1, .5) == .5
+    assert lerp(-1, 1, .5) == 0
+
+    assert lerps((0,0), (1,1), .5) == (.5, .5)
+    assert lerps((0,0), (0,1), .5) == (0, .5)
+
+def testword():
+    words = [Word('bruce'), Word('config'), Word('gentle')]
+    assert 'bruce' in words
+    assert 'tainted' not in words
+
+    words[-1].text = words[-1].text[1:]
+    assert words[-1].text == entle
+
+def testgame():
+    words = getwords()
+    random.seed(0)
+    game = TypingGame(words, 3, 8)
+
+    nwords = 26
+    game.current.extend(game.spawn(nwords))
+    assert len(game.current) == nwords
+    assert len(set(game.current)) == len(game.current)
+
+    assert sorted(game.current) == ['achieved', 'bios', 'chamber', 'decision',
+                                    'emission', 'figure', 'growing', 'hull',
+                                    'invited', 'jason', 'kidney', 'lat',
+                                    'midi', 'nights', 'offer', 'photo',
+                                    'quote', 'restrict', 'sms', 'tree', 'unit',
+                                    'vector', 'writers', 'xml', 'yard',
+                                    'zealand']
+
+    word = game.shoot('b')
+    assert word.initial == 'bios'
+    assert word.text == 'ios'
+
+    word = game.shoot('z')
+    assert word is None
+
+    word = game.shoot('i')
+    assert word.initial == 'bios'
+    assert word.text == 'os'
+
+    game.shoot('o')
+    word = game.shoot('s')
+    assert word.text == ''
+    assert word.initial == 'bios'
+    assert word.text == ''
+
+    word = game.shoot('a')
+    assert word.text == 'chieved'
+    assert word.initial == 'achieved'
+
+    for letter in 'chieve':
+        word = game.shoot(letter)
+    assert word.text == 'd'
+    assert word.initial == 'achieved'
+
+    word = game.shoot('d')
+    assert word.text == ''
+
+    word = game.shoot('g')
+    # now there are several 'r's exposed
+
+    word = game.shoot('r')
+    #print(word, word.initial, word.text)
+
+    #print(list(word.text for word in game.current))
+
+    random.seed()
+
+def tests():
+    testlerp()
+    testgame()
 
 def main():
     """
-    ZPype: A clone of ZType, http://zty.pe
+    ZPype: ZType clone.
     """
-    parser = argparse.ArgumentParser(prog='zpype', description=main.__doc__)
-    parser.add_argument('--words', type=argparse.FileType(), default='words.txt')
-    parser.add_argument('--logging')
-    parser.add_argument('--filter', nargs='+', default='',
-                        help='Only show logging from this name. %(default)s')
-    parser.add_argument('--stepper', action='store_true',
-                        help='Start game in step mode. TAB to step, SHIFT+TAB'
-                             ' to toggle stepping.')
+    parser = argparse.ArgumentParser(description=main.__doc__)
+    parser.add_argument('--no-run', action='store_true', help='Just tests no game.')
     args = parser.parse_args()
 
-    words = [line.strip() for line in args.words if len(line.strip()) > 2]
-    del args.words
+    tests()
 
-    if args.logging or args.filter:
-        logging.basicConfig(level=getattr(logging, args.logging))
-    del args.logging
+    if args.no_run:
+        return
 
-    # XXX: multiple filters not working
-    if args.filter:
-        logger = logging.getLogger(MODULENAME)
-        for name in args.filter:
-            logger.addFilter(logging.Filter(name))
-    del args.filter
+    size = (500,1000)
+    background = renderbackground(size)
+    g.game = TypingGame(getwords())
+    engine = Engine(size, background=background)
 
-    engine = bind_and_run(Engine, args)
-    g.game = Game(words, 4)
-    g.statestack.append(MainmenuState())
-    engine.run()
+    stateclass = GameplayState
+    engine.run(stateclass())
 
 if __name__ == '__main__':
     main()
