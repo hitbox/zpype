@@ -1,3 +1,6 @@
+This was going to be a typing game, and has been (several times), but right now
+it is my current target for crazy ideas.
+
 # ZPype
 Very rudimentry Python 3 clone of ZType
 http://zty.pe
